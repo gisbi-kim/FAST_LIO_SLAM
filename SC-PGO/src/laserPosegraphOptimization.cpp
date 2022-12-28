@@ -129,16 +129,66 @@ ros::Publisher pubMapAftPGO, pubOdomAftPGO, pubPathAftPGO;
 ros::Publisher pubLoopScanLocal, pubLoopSubmapLocal;
 ros::Publisher pubOdomRepubVerifier;
 
+std::fstream pgSaveStream; // pg: pose-graph
+std::vector<std::string> edges_str;
+std::vector<std::string> vertices_str;
+
 std::string save_directory;
-std::string pgKITTIformat, pgScansDirectory;
+std::string pgKITTIformat, pgScansDirectory, pgSCDDirectory;
 std::string odomKITTIformat;
 std::fstream pgTimeSaveStream;
+
+void saveSCD(std::string fileName, Eigen::MatrixXd matrix, std::string delimiter = " ")
+{
+    // delimiter: ", " or " " etc.
+
+    int precision = 3; // or Eigen::FullPrecision, but SCD does not require such accruate precisions so 3 is enough.
+    const static Eigen::IOFormat the_format(precision, Eigen::DontAlignCols, delimiter, "\n");
+
+    std::ofstream file(fileName);
+    if (file.is_open())
+    {
+        file << matrix.format(the_format);
+        file.close();
+    }
+}
 
 std::string padZeros(int val, int num_digits = 6) {
   std::ostringstream out;
   out << std::internal << std::setfill('0') << std::setw(num_digits) << val;
   return out.str();
 }
+
+void writeVertex(const int _node_idx, const gtsam::Pose3& _initPose)
+{
+    gtsam::Point3 t = _initPose.translation();
+    gtsam::Rot3 R = _initPose.rotation();
+
+    std::string curVertexInfo {
+        "VERTEX_SE3:QUAT " + std::to_string(_node_idx) + " "
+        + std::to_string(t.x()) + " " + std::to_string(t.y()) + " " + std::to_string(t.z())  + " "
+        + std::to_string(R.toQuaternion().x()) + " " + std::to_string(R.toQuaternion().y()) + " "
+        + std::to_string(R.toQuaternion().z()) + " " + std::to_string(R.toQuaternion().w()) };
+
+    // pgVertexSaveStream << curVertexInfo << std::endl;
+    vertices_str.emplace_back(curVertexInfo);
+}
+
+void writeEdge(const std::pair<int, int> _node_idx_pair, const gtsam::Pose3& _relPose)
+{
+    gtsam::Point3 t = _relPose.translation();
+    gtsam::Rot3 R = _relPose.rotation();
+
+    std::string curEdgeInfo {
+        "EDGE_SE3:QUAT " + std::to_string(_node_idx_pair.first) + " " + std::to_string(_node_idx_pair.second) + " "
+        + std::to_string(t.x()) + " " + std::to_string(t.y()) + " " + std::to_string(t.z())  + " "
+        + std::to_string(R.toQuaternion().x()) + " " + std::to_string(R.toQuaternion().y()) + " "
+        + std::to_string(R.toQuaternion().z()) + " " + std::to_string(R.toQuaternion().w()) };
+
+    // pgEdgeSaveStream << curEdgeInfo << std::endl;
+    edges_str.emplace_back(curEdgeInfo);
+}
+
 
 gtsam::Pose3 Pose6DtoGTSAMPose3(const Pose6D& p)
 {
@@ -583,6 +633,7 @@ void process_pg()
                     // prior factor 
                     gtSAMgraph.add(gtsam::PriorFactor<gtsam::Pose3>(init_node_idx, poseOrigin, priorNoise));
                     initialEstimate.insert(init_node_idx, poseOrigin);
+		    writeVertex(init_node_idx, poseOrigin);
                     // runISAM2opt();          
                 }   
                 mtxPosegraph.unlock();
@@ -593,11 +644,15 @@ void process_pg()
             } else /* consecutive node (and odom factor) after the prior added */ { // == keyframePoses.size() > 1 
                 gtsam::Pose3 poseFrom = Pose6DtoGTSAMPose3(keyframePoses.at(prev_node_idx));
                 gtsam::Pose3 poseTo = Pose6DtoGTSAMPose3(keyframePoses.at(curr_node_idx));
+		gtsam::Pose3 relPose = poseFrom.between(poseTo);
+
 
                 mtxPosegraph.lock();
                 {
                     // odom factor
                     gtSAMgraph.add(gtsam::BetweenFactor<gtsam::Pose3>(prev_node_idx, curr_node_idx, poseFrom.between(poseTo), odomNoise));
+		     writeVertex(curr_node_idx, poseTo);
+                    writeEdge({prev_node_idx, curr_node_idx}, relPose);
 
                     // gps factor 
                     if(hasGPSforThisKF) {
@@ -621,6 +676,12 @@ void process_pg()
             // save utility 
             std::string curr_node_idx_str = padZeros(curr_node_idx);
             pcl::io::savePCDFileBinary(pgScansDirectory + curr_node_idx_str + ".pcd", *thisKeyFrame); // scan 
+            
+	     // save sc data
+            const auto& curr_scd = scManager.getConstRefRecentSCD();
+            std::string curr_scd_node_idx = padZeros(scManager.polarcontexts_.size() - 1);
+            saveSCD(pgSCDDirectory + curr_scd_node_idx + ".scd", curr_scd);
+
             pgTimeSaveStream << timeLaser << std::endl; // path 
         }
 
@@ -687,6 +748,7 @@ void process_icp(void)
                 gtsam::Pose3 relative_pose = relative_pose_optional.value();
                 mtxPosegraph.lock();
                 gtSAMgraph.add(gtsam::BetweenFactor<gtsam::Pose3>(prev_node_idx, curr_node_idx, relative_pose, robustLoopNoise));
+		writeEdge({prev_node_idx, curr_node_idx}, relative_pose); // giseop
                 // runISAM2opt();
                 mtxPosegraph.unlock();
             } 
@@ -764,6 +826,19 @@ void process_viz_map(void)
             pubMap();
         }
     }
+    
+    // save pose graph (runs when programe is closing)
+    cout << "****************************************************" << endl; 
+    cout << "Saving the posegraph ..." << endl; // giseop
+
+    for(auto& _line: vertices_str)
+        pgSaveStream << _line << std::endl;
+    for(auto& _line: edges_str)
+        pgSaveStream << _line << std::endl;
+
+    pgSaveStream.close();
+
+
 } // pointcloud_viz
 
 
@@ -780,6 +855,12 @@ int main(int argc, char **argv)
     pgScansDirectory = save_directory + "Scans/";
     auto unused = system((std::string("exec rm -r ") + pgScansDirectory).c_str());
     unused = system((std::string("mkdir -p ") + pgScansDirectory).c_str());
+
+    pgSCDDirectory = save_directory + "SCDs/"; // SCD: scan context descriptor
+    unused = system((std::string("exec rm -r ") + pgSCDDirectory).c_str());
+    unused = system((std::string("mkdir -p ") + pgSCDDirectory).c_str());
+
+    pgSaveStream = std::fstream(save_directory + "singlesession_posegraph.g2o", std::fstream::out);
 
 	nh.param<double>("keyframe_meter_gap", keyframeMeterGap, 2.0); // pose assignment every k m move 
 	nh.param<double>("keyframe_deg_gap", keyframeDegGap, 10.0); // pose assignment every k deg rot 
@@ -826,6 +907,8 @@ int main(int argc, char **argv)
 	std::thread viz_path {process_viz_path}; // visualization - path (high frequency)
 
  	ros::spin();
+        
+        viz_map.join();
 
 	return 0;
 }
